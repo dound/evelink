@@ -11,6 +11,7 @@ from xml.etree import ElementTree
 
 from evelink.thirdparty import six
 from evelink.thirdparty.six.moves import urllib
+from evelink.rate_limit import RateLimitManager
 
 _log = logging.getLogger('evelink.api')
 
@@ -235,6 +236,7 @@ class API(object):
             raise ValueError("The provided SSO token must be a tuple of (token, type).")
         self.sso_token = sso_token
         self._set_last_timestamps()
+        self.rate_limiter = RateLimitManager()
 
     def _set_last_timestamps(self, current_time=0, cached_until=0):
         self.last_timestamps = {
@@ -275,13 +277,33 @@ class API(object):
         if not cached:
             # no cached response body found, call the API for one.
             full_path = "https://%s/%s.xml.aspx" % (self.base_url, path)
-            response, robj = self.send_request(full_path, params)
+            block_secs = self.rate_limiter.block_until_can_start_new_request()
+            rate_limit_finished = False
+            if block_secs >= 0.1:
+                _log.debug('was rate limit blocked for %.1f seconds (%s)',
+                           block_secs, full_path)
+            try:
+                response, robj = self.send_request(full_path, params)
+            except:
+                self.rate_limiter.finished(success=False)
+                raise
+
+            if _has_requests:
+                code = robj.status_code
+            else:
+                code = robj.getcode()
+            if code != 200:
+                self.rate_limiter.finished(success=False)
+                rate_limit_finished = True
         else:
             _log.debug("Cache hit, returning cached payload")
+            rate_limit_finished = True
 
         try:
             tree = ElementTree.fromstring(response)
         except _xml_error as e:
+            if not rate_limit_finished:
+                self.rate_limiter.finished(success=False)
             # If this is due to an HTTP error, raise the HTTP error
             self.maybe_raise_http_error(robj)
             # otherwise, raise the parse error
@@ -297,7 +319,10 @@ class API(object):
             self.cache.put(key, response, expires_time - current_time)
 
         error = tree.find('error')
-        if error is not None:
+        has_error = error is not None
+        if not rate_limit_finished:
+            self.rate_limiter.finished(success=not has_error)
+        if has_error:
             code = error.attrib['code']
             message = error.text.strip()
             exc = APIError(code, message, current_time, expires_time)
